@@ -1,6 +1,7 @@
 ---
 name: feishu-chat
-description: Bridge the current Claude Code session to Feishu/Lark so the user can chat with this session from their phone or Feishu desktop via DM to the lark-cli bot. Starts a persistent listener on `im.message.receive_v1`; each incoming Feishu message arrives as a tool notification and you reply via `lark-cli im +messages-reply`. Invoke this skill whenever the user asks to "start the feishu bridge", "listen for feishu/lark messages", "chat with this session from my phone", "talk via feishu", "open the lark channel", or just runs `/feishu-chat`. Use it proactively if the user mentions wanting to control or message this session from outside the terminal via Feishu/Lark.
+version: 1.1.0
+description: Bridge the current Claude Code session to Feishu/Lark so the user can chat with this session from their phone or Feishu desktop via DM to the lark-cli bot. Starts a persistent listener on `im.message.receive_v1`; each incoming Feishu message arrives as a tool notification and you reply via `lark-cli im +messages-reply`. Handles rich messages (post / image+text / quoted replies / files) by fetching the raw message with lark-cli, and stamps each reply with a context/model/effort footer. Invoke this skill whenever the user asks to "start the feishu bridge", "listen for feishu/lark messages", "chat with this session from my phone", "talk via feishu", "open the lark channel", or just runs `/feishu-chat`. Use it proactively if the user mentions wanting to control or message this session from outside the terminal via Feishu/Lark.
 ---
 
 # Feishu Chat
@@ -63,31 +64,123 @@ lark-cli im +messages-send --as bot --user-id "$USER_OPEN_ID" \
 
 Tell the user the bridge is up and to look for the bot's DM in Feishu.
 
-## Step 4 — Handle each incoming message
+## Step 4 — Read each incoming message
 
-Every Monitor notification will look like one NDJSON line:
+Every Monitor notification is one NDJSON line. The envelope carries more than just text:
 
 ```
-{"type":"im.message.receive_v1","event_id":"...","message_id":"om_...","chat_id":"oc_...","sender_id":"ou_...","message_type":"text","content":"<the text the user sent>"}
+{"type":"im.message.receive_v1","event_id":"...","message_id":"om_...","chat_id":"oc_...",
+ "sender_id":"ou_...","message_type":"post","content":"<pre-rendered text>",
+ "reply_to":"om_...","root_id":"...","mentions":[{"id":"ou_...","key":"@_user_1","name":"..."}]}
 ```
 
-For each notification:
+`content` is **pre-rendered by lark-cli**, not raw Feishu JSON. A `post` (Feishu's rich-text type — "image + text", bold, and links all arrive as this) comes through as readable text with resource handles inline:
 
-1. Extract `content` and `message_id` from the JSON.
-2. **Treat `content` as if the user typed it into Claude Code directly** — same reasoning, same tool use, same safety rules. The bridge is a transport, not a privilege escalation.
-3. Reply with:
+```
+![Image](img_v3_0214j_ab2e0227-...)
+运行以后有这个提示，但是命令行提示
+OK: Profile "hab-alt" added
+```
 
-   ```bash
-   lark-cli im +messages-reply --as bot \
-     --message-id <message_id> \
-     --text "<your reply>"
-   ```
+An `image` or `file` message instead renders as a tag:
 
-   Use the **incoming `message_id`** (not `chat_id`) so the reply threads correctly. For longer replies, prefer `--markdown` over `--text` — Feishu renders the markdown.
+```
+<file key="file_v3_0014q_e1d4271c-..." name="report.pdf"/>
+```
 
-4. The listener keeps streaming. Don't re-arm after each reply.
+Both forms are verified against live messages. Don't pattern-match on one of them — to pull handles out of any shape, scan `content` for `(?:img|file)_[A-Za-z0-9_-]+`, which catches both.
 
-Why threaded reply: `+messages-reply` keeps replies bound to the originating message, which makes the Feishu UI show the call-and-response clearly. `+messages-send` creates a fresh top-level message and loses that connection.
+So the text is usually already usable. What `content` does **not** contain: the bytes of any image or file, and the body of any quoted message. Fetch those yourself — see Step 5.
+
+**Decide per message, from the envelope, not by guessing:**
+
+| Envelope says | What it means | Do |
+|---|---|---|
+| `message_type == "text"`, no `reply_to` | plain message | reply directly, no fetch |
+| `message_type` is `post` / `image` / `file` | rich text, image, or attachment | fetch resources if the content matters (5a) |
+| `reply_to` is present | user quoted an earlier message | fetch the quoted message (5b) |
+| `message_type` is anything else | `merge_forward`, `interactive`, `share_*`, … | fetch raw to see what it is (5c) |
+
+**One user action can arrive as several messages.** Sending a picture with a caption often lands as a `text` event and a separate `file`/`image` event, back to back, rather than one `post`. If a bare attachment shows up right after a message that reads like it's about an attachment ("这张图是什么颜色？"), they're almost certainly the same thought — answer once, considering both, instead of replying twice and treating the image as contextless.
+
+Treat the text as if the user typed it into Claude Code directly — same reasoning, same tool use, same safety rules. The bridge is a transport, not a privilege escalation.
+
+## Step 5 — Fetch what the envelope doesn't carry
+
+All three recipes use the **bot** identity, because the bot is the party that received the message. If you run several lark-cli profiles, add `--profile <name>` to match the one the listener runs under — a different bot may not be in the conversation and will get nothing back.
+
+### 5a — Images and files
+
+The handles are in `content`. The prefix tells you which `--type` to pass — `img_*` → `image`, `file_*` → `file` — but it does **not** tell you what the content actually is: an image sent as an attachment gets a `file_*` key. Download one per handle:
+
+```bash
+lark-cli im +messages-resources-download \
+  --message-id om_xxx --file-key img_v3_xxx --type image \
+  --output ./feishu-img --as bot
+```
+
+Then **read `data.saved_path` from the returned JSON and open that path** — lark-cli appends an extension based on the response's content type, so the file does not land where you asked. Verified: `--output ./probe-img` produced `probe-img.jpg`. Opening the path you passed in fails with a confusing "no such file".
+
+Once you have the local path, view the image with the Read tool as you would any other image. That is what makes "image + a question about it" work — you see the picture, not a placeholder.
+
+**Don't trust the extension to tell you what the file is.** An image sent as an attachment (rather than inline) arrives as `message_type: "file"`, and the download lands as `.bin` — verified: a PNG came back as `e2e-dl.bin`. Judge by content, not by suffix; `file <path>` will tell you. If it's an image, read it as one regardless of what it's called.
+
+`--output` must be **cwd-relative**; absolute paths and `..` are rejected. `--type` must match the key's prefix: `image` for `img_*`, `file` for `file_*`.
+
+### 5b — Quoted / replied-to messages
+
+When `reply_to` is set, the user is pointing at an earlier message whose text is **not** in `content`. Their message is often meaningless without it ("这个是小号", "加了"). Fetch it:
+
+```bash
+lark-cli im +messages-mget --message-ids om_xxx --no-reactions --as bot
+```
+
+Use the **`reply_to` value** as the id, not the incoming `message_id`. If the quoted message itself contains `img_*`/`file_*` handles, download them with `--message-id` set to the **quoted** message's id — resources hang off the message they were sent in.
+
+### 5c — Anything unfamiliar
+
+Same `mget` call, with the incoming `message_id`. It returns the full record — `msg_type`, `content`, `sender`, `mentions`, `reply_to` — which is enough to tell a `merge_forward` (a bundle of forwarded messages) from a `share_calendar_event` or an `interactive` card. Read it and respond to what's actually there.
+
+If a type is genuinely not something you can act on, say so in the reply rather than silently ignoring the message — from the user's phone, silence and failure look identical.
+
+## Step 6 — Reply, with a footer
+
+Compute the footer, then send it as part of the reply:
+
+```bash
+FOOTER=$(python3 ~/.claude/skills/feishu-chat/bin/footer.py 2>/dev/null)
+lark-cli im +messages-reply --as bot \
+  --message-id om_xxx \
+  --markdown "$(cat <<'FEISHU_REPLY_EOF'
+<your reply text>
+FEISHU_REPLY_EOF
+)$FOOTER"
+```
+
+The heredoc delimiter has to be something your reply text will never contain on a line by itself. Plain `EOF` is a real hazard here: if the reply happens to include a line reading `EOF`, the message is silently truncated there and the remainder is executed as shell commands — with exit status still `0`, so nothing looks wrong. Keep the long delimiter.
+
+That path is where the standard install puts it (`~/.claude/skills/feishu-chat` symlinked at the repo). If you installed elsewhere, use your own path — and note `$CLAUDE_PLUGIN_ROOT` is **not** set for a symlinked skill, so don't reach for it.
+
+The footer renders as a rule plus one line, matching what feishu-bridge shows:
+
+```
+────────────
+🧠 148K · Opus 5 · xhigh
+```
+
+It reports context tokens used, the model, and the reasoning effort, so the user can see from their phone how full the context is and which model answered — the thing you cannot tell from a chat bubble.
+
+Rules for the footer:
+
+- **Append it to the last message you send for a turn**, not to every intermediate one — same as the terminal, where the strip appears once per turn.
+- **If `footer.py` prints nothing, send the reply without it.** It stays silent whenever it cannot determine a trustworthy value. A footer is decoration; a *wrong* context number is worse than none, because the user will act on it.
+- **Don't hand-write or estimate the numbers.** If the helper is silent, the honest output is no footer.
+
+Prefer `--markdown` over `--text` for anything with structure — Feishu renders it. Use `--text` for short plain replies.
+
+Use the **incoming `message_id`** (not `chat_id`) so the reply threads correctly. `+messages-reply` keeps the call-and-response visible in the Feishu UI; `+messages-send` creates a fresh top-level message and loses that connection.
+
+The listener keeps streaming. Don't re-arm after each reply.
 
 ## Stopping
 
@@ -95,7 +188,8 @@ The user can ask "stop the feishu listener" — call `TaskStop` on the Monitor t
 
 ## Things to watch for
 
-- **`message_type` is not always `text`.** Images, files, audio, etc. come through with the same envelope; `content` is the pre-rendered text representation (e.g., `[image]` or extracted caption). For interactive cards `content` is raw JSON — `fromjson` it in your reply logic if needed.
-- **Multiple sessions on the same lark-cli config share the same bot identity.** If two sessions both run this skill at once, both will receive every message (broadcast semantics) AND both will reply — the user sees two bot messages. Coordinate via `/inter-session` if you intentionally run multiple bridges.
-- **Replies are not echoed back through the listener** — Lark/Feishu filters self-messages, so you won't accidentally feedback-loop on your own replies.
+- **Fetch on demand, not reflexively.** A `post` whose text is self-contained needs no download. Fetch when the content actually bears on the answer — an image the user is asking about, a quote you can't interpret without.
+- **Multiple sessions on the same lark-cli config share the same bot identity.** If two sessions both run this skill at once, both receive every message AND both reply — the user sees two bot messages. Coordinate via `/inter-session` if you intentionally run multiple bridges.
+- **Replies are not echoed back through the listener** — Feishu filters self-messages, so you won't feedback-loop on your own replies.
 - **The Monitor's stdout is the only event channel.** Errors on stderr (websocket disconnects, etc.) go to the output file but don't trigger notifications. If a long stretch goes quiet, ask the user to send a test ping; if nothing arrives, check `lark-cli event status` for daemon health.
+- **The context number can lag by about one turn.** It is read from the transcript, which Claude Code writes asynchronously. It's a gauge, not an invoice.

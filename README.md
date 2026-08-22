@@ -56,11 +56,39 @@ Then open Feishu, find the bot's DM, and start chatting. To stop, tell the sessi
 "stop the feishu listener" — or just end the session, since the listener is torn down
 with it.
 
+## Rich messages
+
+Feishu messages are not just text, and the bridge handles the common shapes:
+
+| You send | What happens |
+|---|---|
+| Plain text | delivered as-is |
+| **Image + text** | the session downloads the image and actually looks at it — whether it arrives as one rich `post` or as a caption plus a separate attachment |
+| A **quoted reply** | the session fetches the message you quoted, so "this one" and "加了" still make sense |
+| **Files** | downloaded on demand and read |
+| Forwards, cards, shared events | fetched raw so the session can see what they are |
+
+The pre-rendered text arrives in the event itself; anything heavier (image bytes, the body
+of a quoted message) is fetched on demand with `lark-cli`, so the common text-only case
+costs no extra round trip.
+
+## Reply footer
+
+Every reply ends with the same strip Claude Code shows in the terminal:
+
+```
+────────────
+🧠 148K · Opus 5 · xhigh
+```
+
+Context tokens used, model, reasoning effort — so from your phone you can see how full the
+context is and which model answered. It's computed by [`bin/footer.py`](./bin/footer.py)
+from the session transcript. If it can't determine a trustworthy value it prints nothing
+and the reply goes out without a footer: a wrong context number is worse than no number.
+The count can lag by about a turn, since Claude Code writes the transcript asynchronously.
+
 ## Notes
 
-- **Non-text messages** (images, files, cards) arrive through the same channel; `content`
-  is a pre-rendered text representation (e.g. `[image]`, an extracted caption, or raw card
-  JSON).
 - **Multiple sessions sharing one lark-cli config share the bot identity.** If two sessions
   run the bridge at once, both receive *and* reply to every message — you'll see duplicate
   bot replies.
