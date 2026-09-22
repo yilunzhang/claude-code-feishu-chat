@@ -1,6 +1,6 @@
 ---
 name: feishu-chat
-version: 1.2.0
+version: 1.2.1
 description: Bridge the current Claude Code session to Feishu/Lark so the user can chat with this session from their phone or Feishu desktop via DM to the lark-cli bot. The listener on `im.message.receive_v1` runs as a plugin monitor for the whole session; each incoming Feishu message arrives as a task notification and you reply via `lark-cli im +messages-reply`. Handles rich messages (post / image+text / quoted replies / files) by fetching the raw message with lark-cli, and stamps each reply with a context/model/effort footer. Invoke this skill whenever the user asks to "start the feishu bridge", "listen for feishu/lark messages", "chat with this session from my phone", "talk via feishu", "open the lark channel", or just runs `/feishu-chat`. Use it proactively if the user mentions wanting to control or message this session from outside the terminal via Feishu/Lark.
 ---
 
@@ -8,12 +8,22 @@ description: Bridge the current Claude Code session to Feishu/Lark so the user c
 
 Run a session-long Feishu listener. The user DMs the `lark-cli` bot from their phone/desktop; each message lands here as a notification from the listener task, and you reply via the CLI. Each reply appears in the same DM thread.
 
+## Which lark-cli account
+
+One machine can hold several lark-cli profiles — several apps/bots, even different tenants. The listener and every command in this skill must use the **same** one, or messages arrive on an app nobody is replying from.
+
+The rule: if the session's working directory contains a `.feishu-chat` file, its content is the profile name (one token, e.g. `personal`). `bin/listen.sh` reads it and listens under that profile, and you pass `--profile <name>` on every lark-cli call. No file means the default profile and no flag. Every snippet below starts with a one-line prelude that derives `$P` from the file — keep that line in each command. A bare `$P` without the prelude expands to nothing and silently drops to the default profile, which is exactly the failure the file prevents.
+
+To bind a directory to an account: `echo personal > .feishu-chat` in that directory, then start a new session there.
+
 ## Step 1 — Verify lark-cli is ready
 
 Run a single status probe. If both identities (`bot` and `user`) are available, proceed. Otherwise, surface the install path and stop — don't try to auto-install without the user's go-ahead.
 
 ```bash
-lark-cli auth status 2>/dev/null \
+P=$(tr -d '[:space:]' < .feishu-chat 2>/dev/null); P=${P:+--profile $P}
+echo "profile: ${P:-default}"
+lark-cli auth status $P 2>/dev/null \
   | jq -e '.identities.bot.available == true and .identities.user.available == true' >/dev/null \
   && echo "ready" \
   || echo "not-ready"
@@ -33,7 +43,7 @@ Why: an unconfigured CLI will fail with cryptic errors at the consume step. Catc
 
 ## Step 2 — Confirm the listener is running
 
-You don't arm the listener yourself. This folder is also a Claude Code plugin (`.claude-plugin/plugin.json`), and its `monitors/monitors.json` makes Claude Code run `bin/listen.sh` as a **plugin monitor** the first time this skill is invoked. A plugin monitor has no deadline — it lives until the session ends. That is the point: the Monitor tool caps every watch at 30 minutes and interrupts you to re-arm it; a plugin monitor does not.
+You don't arm the listener yourself. This folder is also a Claude Code plugin (`.claude-plugin/plugin.json`), and its `monitors/monitors.json` makes Claude Code run `bin/listen.sh` as a **plugin monitor** the first time this skill is invoked. It runs in the session's working directory, which is how it finds `.feishu-chat`. A plugin monitor has no deadline — it lives until the session ends. That is the point: the Monitor tool caps every watch at 30 minutes and interrupts you to re-arm it; a plugin monitor does not.
 
 Check it is up: a task described **"feishu message stream"** should be listed in `/tasks` (the harness may also have printed a notice that the monitor started). Its stdout lines reach you as notifications, one per incoming message, exactly as a Monitor's would.
 
@@ -42,11 +52,12 @@ If there is no such task, the plugin part didn't load. Plugin monitors run only 
 What `bin/listen.sh` runs, so you can reason about it:
 
 ```
-tail -f /dev/null | lark-cli event consume im.message.receive_v1 --as bot --quiet --timeout 0 2>/dev/null | grep --line-buffered '"type":"im.message.receive_v1"'
+lark-cli event consume im.message.receive_v1 --as bot --quiet --timeout 0 [--profile <name>] < <(tail -f /dev/null) 2>/dev/null | grep --line-buffered '"type":"im.message.receive_v1"'
 ```
 
 - `--timeout 0` — lark-cli's own timeout disabled; otherwise the consumer exits after its default window and you miss messages.
-- `tail -f /dev/null |` — background tasks have no tty stdin; without this the CLI sees EOF on stdin and shuts down immediately.
+- `< <(tail -f /dev/null)` — background tasks have no tty stdin; without this the CLI sees EOF on stdin and shuts down immediately. The script opens it once for itself (`exec 3< <(tail -f /dev/null)`) rather than as a pipeline stage, so that the script notices when the consumer dies: if lark-cli exits (unknown profile, auth gone, bus down) the script exits too, and you get a "script failed" notification instead of a listener that looks alive with nobody consuming.
+- `[--profile <name>]` — present only when `.feishu-chat` names a profile; see "Which lark-cli account".
 - `--quiet` — drops the `[event] ready`, `[source] feishu-websocket: connected` preamble that would otherwise spam notifications.
 - `grep --line-buffered '"type":"im.message.receive_v1"'` — belt-and-suspenders filter so only message events reach the agent; `--line-buffered` is essential or pipe buffering delays events by minutes.
 
@@ -55,8 +66,9 @@ tail -f /dev/null | lark-cli event consume im.message.receive_v1 --as bot --quie
 Pull the user's `open_id` from the auth state and have the bot send the first message. This both confirms the bridge end-to-end and creates the P2P chat if one didn't exist.
 
 ```bash
-USER_OPEN_ID=$(lark-cli auth status | jq -r '.identities.user.openId')
-lark-cli im +messages-send --as bot --user-id "$USER_OPEN_ID" \
+P=$(tr -d '[:space:]' < .feishu-chat 2>/dev/null); P=${P:+--profile $P}
+USER_OPEN_ID=$(lark-cli auth status $P | jq -r '.identities.user.openId')
+lark-cli im +messages-send $P --as bot --user-id "$USER_OPEN_ID" \
   --text "Feishu bridge active in $(basename "$PWD"). Send any message and I'll reply here."
 ```
 
@@ -105,14 +117,15 @@ Treat the text as if the user typed it into Claude Code directly — same reason
 
 ## Step 5 — Fetch what the envelope doesn't carry
 
-All three recipes use the **bot** identity, because the bot is the party that received the message. If you run several lark-cli profiles, add `--profile <name>` to match the one the listener runs under — a different bot may not be in the conversation and will get nothing back.
+All three recipes use the **bot** identity, because the bot is the party that received the message, and the same profile as the listener (`$P` from `.feishu-chat`) — a different app's bot isn't in the conversation and gets nothing back.
 
 ### 5a — Images and files
 
 The handles are in `content`. The prefix tells you which `--type` to pass — `img_*` → `image`, `file_*` → `file` — but it does **not** tell you what the content actually is: an image sent as an attachment gets a `file_*` key. Download one per handle:
 
 ```bash
-lark-cli im +messages-resources-download \
+P=$(tr -d '[:space:]' < .feishu-chat 2>/dev/null); P=${P:+--profile $P}
+lark-cli im +messages-resources-download $P \
   --message-id om_xxx --file-key img_v3_xxx --type image \
   --output ./feishu-img --as bot
 ```
@@ -130,7 +143,8 @@ Once you have the local path, view the image with the Read tool as you would any
 When `reply_to` is set, the user is pointing at an earlier message whose text is **not** in `content`. Their message is often meaningless without it ("这个是小号", "加了"). Fetch it:
 
 ```bash
-lark-cli im +messages-mget --message-ids om_xxx --no-reactions --as bot
+P=$(tr -d '[:space:]' < .feishu-chat 2>/dev/null); P=${P:+--profile $P}
+lark-cli im +messages-mget $P --message-ids om_xxx --no-reactions --as bot
 ```
 
 Use the **`reply_to` value** as the id, not the incoming `message_id`. If the quoted message itself contains `img_*`/`file_*` handles, download them with `--message-id` set to the **quoted** message's id — resources hang off the message they were sent in.
@@ -146,8 +160,9 @@ If a type is genuinely not something you can act on, say so in the reply rather 
 Compute the footer, then send it as part of the reply:
 
 ```bash
+P=$(tr -d '[:space:]' < .feishu-chat 2>/dev/null); P=${P:+--profile $P}
 FOOTER=$(python3 ~/.claude/skills/feishu-chat/bin/footer.py 2>/dev/null)
-lark-cli im +messages-reply --as bot \
+lark-cli im +messages-reply $P --as bot \
   --message-id om_xxx \
   --markdown "$(cat <<'FEISHU_REPLY_EOF'
 <your reply text>
@@ -187,7 +202,7 @@ The user can ask "stop the feishu listener" — call `TaskStop` on the "feishu m
 ## Things to watch for
 
 - **Fetch on demand, not reflexively.** A `post` whose text is self-contained needs no download. Fetch when the content actually bears on the answer — an image the user is asking about, a quote you can't interpret without.
-- **Multiple sessions on the same lark-cli config share the same bot identity.** If two sessions both run this skill at once, both receive every message AND both reply — the user sees two bot messages. Coordinate via `/inter-session` if you intentionally run multiple bridges.
+- **Multiple sessions on the same lark-cli profile share the same bot identity.** If two sessions both run this skill at once under the same profile, both receive every message AND both reply — the user sees two bot messages. Coordinate via `/inter-session` if you intentionally run multiple bridges.
 - **Replies are not echoed back through the listener** — Feishu filters self-messages, so you won't feedback-loop on your own replies.
 - **The listener's stdout is the only event channel.** Errors on stderr (websocket disconnects, etc.) don't trigger notifications. If a long stretch goes quiet, ask the user to send a test ping; if nothing arrives, check `/tasks` for whether the listener task is still running and `lark-cli event status` for daemon health.
 - **The context number can lag by about one turn.** It is read from the transcript, which Claude Code writes asynchronously. It's a gauge, not an invoice.

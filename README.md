@@ -63,6 +63,19 @@ In any Claude Code session:
 Then open Feishu, find the bot's DM, and start chatting. To stop, tell the session
 "stop the feishu listener" — or just end the session, since the listener exits with it.
 
+## Using a different account per directory
+
+`lark-cli` can hold several profiles (apps/bots, even different tenants). To make a project
+talk through a specific one, put the profile name in a `.feishu-chat` file in that directory:
+
+```bash
+cd ~/house && echo personal > .feishu-chat
+```
+
+The listener reads it at start and consumes events under that profile, and the session
+passes `--profile personal` on every lark-cli call. Without the file, the default profile is
+used. The file is read when the listener starts, so add it before opening the session.
+
 ## Rich messages
 
 Feishu messages are not just text, and the bridge handles the common shapes:
