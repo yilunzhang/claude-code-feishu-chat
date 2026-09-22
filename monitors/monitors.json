@@ -1,0 +1,8 @@
+[
+  {
+    "name": "feishu-listener",
+    "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/listen.sh",
+    "description": "feishu message stream",
+    "when": "on-skill-invoke:feishu-chat"
+  }
+]

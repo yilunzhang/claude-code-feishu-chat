@@ -13,7 +13,8 @@ You (Feishu DM)  ──►  lark-cli bot  ──►  Claude Code session  ──
 When you run `/feishu-chat`, the session:
 
 1. Verifies `lark-cli` is configured (both the **bot** and **user** identities are available).
-2. Starts a persistent listener on Feishu's `im.message.receive_v1` event.
+2. Starts the Feishu listener (`bin/listen.sh`, consuming `im.message.receive_v1`) as a Claude Code
+   **plugin monitor**, which runs for the whole session with no time limit.
 3. Sends you a "bridge active" DM from the bot to confirm the channel end-to-end.
 
 From then on, every message you DM the bot lands in the session as if you'd typed it into
@@ -44,6 +45,13 @@ ln -s "$(pwd)/claude-code-feishu-chat" ~/.claude/skills/feishu-chat
 Claude Code loads the skill from `~/.claude/skills/feishu-chat/SKILL.md` (resolved through
 the symlink), so the repo can live anywhere you like.
 
+The folder also carries `.claude-plugin/plugin.json` and `monitors/monitors.json`, so Claude
+Code treats it as a plugin named `feishu-chat@skills-dir` — discovered in place, no
+`/plugin install` step. That is what lets the listener run as a plugin monitor: the
+Monitor tool caps every watch at 30 minutes and asks the session to re-arm, while a plugin
+monitor lives until the session ends. `claude plugin list` should show
+`feishu-chat@skills-dir`. Plugin monitors only run in interactive Claude Code sessions.
+
 ## Usage
 
 In any Claude Code session:
@@ -53,8 +61,7 @@ In any Claude Code session:
 ```
 
 Then open Feishu, find the bot's DM, and start chatting. To stop, tell the session
-"stop the feishu listener" — or just end the session, since the listener is torn down
-with it.
+"stop the feishu listener" — or just end the session, since the listener exits with it.
 
 ## Rich messages
 

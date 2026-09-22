@@ -1,0 +1,8 @@
+{
+  "name": "feishu-chat",
+  "version": "1.2.0",
+  "description": "Bridge the current Claude Code session to a Feishu/Lark DM: the lark-cli bot receives your messages and the session replies in the same thread. The listener runs as a plugin monitor for the whole session.",
+  "author": {
+    "name": "Yilun Zhang"
+  }
+}

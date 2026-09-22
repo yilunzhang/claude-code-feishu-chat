@@ -1,12 +1,12 @@
 ---
 name: feishu-chat
-version: 1.1.0
-description: Bridge the current Claude Code session to Feishu/Lark so the user can chat with this session from their phone or Feishu desktop via DM to the lark-cli bot. Starts a persistent listener on `im.message.receive_v1`; each incoming Feishu message arrives as a tool notification and you reply via `lark-cli im +messages-reply`. Handles rich messages (post / image+text / quoted replies / files) by fetching the raw message with lark-cli, and stamps each reply with a context/model/effort footer. Invoke this skill whenever the user asks to "start the feishu bridge", "listen for feishu/lark messages", "chat with this session from my phone", "talk via feishu", "open the lark channel", or just runs `/feishu-chat`. Use it proactively if the user mentions wanting to control or message this session from outside the terminal via Feishu/Lark.
+version: 1.2.0
+description: Bridge the current Claude Code session to Feishu/Lark so the user can chat with this session from their phone or Feishu desktop via DM to the lark-cli bot. The listener on `im.message.receive_v1` runs as a plugin monitor for the whole session; each incoming Feishu message arrives as a task notification and you reply via `lark-cli im +messages-reply`. Handles rich messages (post / image+text / quoted replies / files) by fetching the raw message with lark-cli, and stamps each reply with a context/model/effort footer. Invoke this skill whenever the user asks to "start the feishu bridge", "listen for feishu/lark messages", "chat with this session from my phone", "talk via feishu", "open the lark channel", or just runs `/feishu-chat`. Use it proactively if the user mentions wanting to control or message this session from outside the terminal via Feishu/Lark.
 ---
 
 # Feishu Chat
 
-Run a persistent Feishu listener for this session. The user DMs the `lark-cli` bot from their phone/desktop; each message lands here as a Monitor notification, and you reply via the CLI. Each reply appears in the same DM thread.
+Run a session-long Feishu listener. The user DMs the `lark-cli` bot from their phone/desktop; each message lands here as a notification from the listener task, and you reply via the CLI. Each reply appears in the same DM thread.
 
 ## Step 1 — Verify lark-cli is ready
 
@@ -31,26 +31,24 @@ If not ready, tell the user:
 
 Why: an unconfigured CLI will fail with cryptic errors at the consume step. Catching it here keeps the failure mode obvious.
 
-## Step 2 — Arm the listener
+## Step 2 — Confirm the listener is running
 
-Start a **persistent Monitor** on the message-receive event. Use the exact command shape below — the flags matter:
+You don't arm the listener yourself. This folder is also a Claude Code plugin (`.claude-plugin/plugin.json`), and its `monitors/monitors.json` makes Claude Code run `bin/listen.sh` as a **plugin monitor** the first time this skill is invoked. A plugin monitor has no deadline — it lives until the session ends. That is the point: the Monitor tool caps every watch at 30 minutes and interrupts you to re-arm it; a plugin monitor does not.
+
+Check it is up: a task described **"feishu message stream"** should be listed in `/tasks` (the harness may also have printed a notice that the monitor started). Its stdout lines reach you as notifications, one per incoming message, exactly as a Monitor's would.
+
+If there is no such task, the plugin part didn't load. Plugin monitors run only in interactive CLI sessions, and only when the folder was discovered as a plugin — `claude plugin list` must show `feishu-chat@skills-dir`, which requires the `.claude-plugin/` manifest under `~/.claude/skills/feishu-chat/`. Tell the user rather than improvising. As a stopgap you can arm `~/.claude/skills/feishu-chat/bin/listen.sh` with the Monitor tool, but that watch expires after 30 minutes and you will be asked to re-arm it.
+
+What `bin/listen.sh` runs, so you can reason about it:
 
 ```
-Monitor(
-  command="lark-cli event consume im.message.receive_v1 --as bot --quiet --timeout 0 < <(tail -f /dev/null) 2>/dev/null | grep --line-buffered '\"type\":\"im.message.receive_v1\"'",
-  description="feishu message stream",
-  persistent=true,
-  timeout_ms=3600000
-)
+tail -f /dev/null | lark-cli event consume im.message.receive_v1 --as bot --quiet --timeout 0 2>/dev/null | grep --line-buffered '"type":"im.message.receive_v1"'
 ```
-
-Why each flag is there:
 
 - `--timeout 0` — lark-cli's own timeout disabled; otherwise the consumer exits after its default window and you miss messages.
-- `< <(tail -f /dev/null)` — background tasks have no tty stdin; without this the CLI sees EOF on stdin and shuts down immediately.
+- `tail -f /dev/null |` — background tasks have no tty stdin; without this the CLI sees EOF on stdin and shuts down immediately.
 - `--quiet` — drops the `[event] ready`, `[source] feishu-websocket: connected` preamble that would otherwise spam notifications.
 - `grep --line-buffered '"type":"im.message.receive_v1"'` — belt-and-suspenders filter so only message events reach the agent; `--line-buffered` is essential or pipe buffering delays events by minutes.
-- `persistent=true` — Monitor stays armed for the lifetime of the session. The skill is meant to be a session-long bridge, not a one-shot.
 
 ## Step 3 — Open the channel (send the user a "ready" DM)
 
@@ -66,7 +64,7 @@ Tell the user the bridge is up and to look for the bot's DM in Feishu.
 
 ## Step 4 — Read each incoming message
 
-Every Monitor notification is one NDJSON line. The envelope carries more than just text:
+Every listener notification is one NDJSON line. The envelope carries more than just text:
 
 ```
 {"type":"im.message.receive_v1","event_id":"...","message_id":"om_...","chat_id":"oc_...",
@@ -184,12 +182,12 @@ The listener keeps streaming. Don't re-arm after each reply.
 
 ## Stopping
 
-The user can ask "stop the feishu listener" — call `TaskStop` on the Monitor task. Or just end the session; persistent monitors are torn down with the session.
+The user can ask "stop the feishu listener" — call `TaskStop` on the "feishu message stream" task. Otherwise it runs until the session ends: a plugin monitor is tied to the session and exits with it. If it exits early you are told: the harness posts a task notification that the "feishu message stream" script failed, with its exit code. Neither re-invoking `/feishu-chat` nor `/reload-plugins` restarts an exited plugin monitor; the way back is a new session, with the Monitor-tool stopgap from Step 2 in the meantime.
 
 ## Things to watch for
 
 - **Fetch on demand, not reflexively.** A `post` whose text is self-contained needs no download. Fetch when the content actually bears on the answer — an image the user is asking about, a quote you can't interpret without.
 - **Multiple sessions on the same lark-cli config share the same bot identity.** If two sessions both run this skill at once, both receive every message AND both reply — the user sees two bot messages. Coordinate via `/inter-session` if you intentionally run multiple bridges.
 - **Replies are not echoed back through the listener** — Feishu filters self-messages, so you won't feedback-loop on your own replies.
-- **The Monitor's stdout is the only event channel.** Errors on stderr (websocket disconnects, etc.) go to the output file but don't trigger notifications. If a long stretch goes quiet, ask the user to send a test ping; if nothing arrives, check `lark-cli event status` for daemon health.
+- **The listener's stdout is the only event channel.** Errors on stderr (websocket disconnects, etc.) don't trigger notifications. If a long stretch goes quiet, ask the user to send a test ping; if nothing arrives, check `/tasks` for whether the listener task is still running and `lark-cli event status` for daemon health.
 - **The context number can lag by about one turn.** It is read from the transcript, which Claude Code writes asynchronously. It's a gauge, not an invoice.
