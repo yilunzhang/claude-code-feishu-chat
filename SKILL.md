@@ -162,13 +162,17 @@ Compute the footer, then send it as part of the reply:
 ```bash
 P=$(tr -d '[:space:]' < .feishu-chat 2>/dev/null); P=${P:+--profile $P}
 FOOTER=$(python3 ~/.claude/skills/feishu-chat/bin/footer.py 2>/dev/null)
-lark-cli im +messages-reply $P --as bot \
-  --message-id om_xxx \
-  --markdown "$(cat <<'FEISHU_REPLY_EOF'
+BODY="$(cat <<'FEISHU_REPLY_EOF'
 <your reply text>
 FEISHU_REPLY_EOF
 )$FOOTER"
+case "$BODY" in @*|-) BODY="$(printf '\342\200\213')$BODY" ;; esac
+lark-cli im +messages-reply $P --as bot \
+  --message-id om_xxx \
+  --markdown "$BODY"
 ```
+
+Keep the `case` line. lark-cli 1.0.97 and later read a `--markdown`/`--text` value that starts with `@` as a local file path (relative to the current directory), and a value of exactly `-` as stdin. A reply that happens to begin with `@` would then fail to send, or post that file's contents into the chat. The line prepends an invisible zero-width space in those two cases, so the text goes out as written on every lark-cli version.
 
 The heredoc delimiter has to be something your reply text will never contain on a line by itself. Plain `EOF` is a real hazard here: if the reply happens to include a line reading `EOF`, the message is silently truncated there and the remainder is executed as shell commands — with exit status still `0`, so nothing looks wrong. Keep the long delimiter.
 
